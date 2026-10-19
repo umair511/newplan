@@ -776,7 +776,7 @@ export const SSJumboRequirementsView: React.FC<SSJumboRequirementsViewProps> = (
     }
     try {
       if (psPlans.length > 0) {
-        const buf = await exportAllFactoryPlansOnlyStyled(psPlans);
+        const buf = await exportAllFactoryPlansOnlyStyled(psPlans, { forceMachine: 'SS' });
         downloadExcelBuffer(buf, `All_SS_Plans_${psPlans.length}plans.xlsx`);
       } else {
         const enriched = list.map(r => ({
@@ -2384,6 +2384,7 @@ export const SSJumboRequirementsView: React.FC<SSJumboRequirementsViewProps> = (
       {/* Complete Full Authoritative Factory / Slitter Sheet Modal */}
       {selectedPlanForFactorySheet && (
         <PlanDetailViewer
+          exportAsMachine="SS"
           plan={selectedPlanForFactorySheet}
           currentUser={defaultPlannerUser}
           onClose={() => setSelectedPlanForFactorySheet(null)}

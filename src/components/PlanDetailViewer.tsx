@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { SlitterPlan, UserProfile, PlanStatus } from '../types';
-import { exportSinglePlanToExcel, downloadExcelBuffer, consolidatePlanItems } from '../services/excelExporter';
+import { exportSinglePlanToExcelStyled, downloadExcelBuffer, consolidatePlanItems } from '../services/excelExporter';
 import { 
   Download, 
   Printer, 
@@ -18,6 +18,8 @@ interface PlanDetailViewerProps {
   currentUser: UserProfile;
   onClose: () => void;
   onUpdateStatus: (planId: string, newStatus: PlanStatus, notes?: string) => void;
+  /** When opened from SS module, force SS01 / SECONDARY SLITTER on Excel export */
+  exportAsMachine?: 'SS' | 'PS' | 'MSL';
 }
 
 export const PlanDetailViewer: React.FC<PlanDetailViewerProps> = ({
@@ -25,14 +27,24 @@ export const PlanDetailViewer: React.FC<PlanDetailViewerProps> = ({
   currentUser,
   onClose,
   onUpdateStatus,
+  exportAsMachine,
 }) => {
   const [approvalNotes, setApprovalNotes] = useState('');
   const [showApprovalModal, setShowApprovalModal] = useState(false);
   const [activeTab, setActiveTab] = useState<'SCHEDULE' | 'SEGMENTS'>('SCHEDULE');
 
-  const handleDownloadExcel = () => {
-    const buffer = exportSinglePlanToExcel(plan);
-    downloadExcelBuffer(buffer, `Slitter_Plan_${plan.plan_number}.xlsx`);
+  const handleDownloadExcel = async () => {
+    const force =
+      exportAsMachine ||
+      (String(plan.machine_id || plan.machine_name || '').toUpperCase().includes('SS')
+        ? 'SS'
+        : undefined);
+    const buffer = await exportSinglePlanToExcelStyled(plan, force as any);
+    const namePrefix = force === 'SS' ? 'SS_Plan' : 'Slitter_Plan';
+    const num = force === 'SS'
+      ? String(plan.plan_number || '').replace(/^PS1-/i, 'SS01-').replace(/^PS01-/i, 'SS01-')
+      : plan.plan_number;
+    downloadExcelBuffer(buffer, `${namePrefix}_${num || plan.id}.xlsx`);
   };
 
   const handlePrint = () => {

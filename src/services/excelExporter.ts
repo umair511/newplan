@@ -12,11 +12,25 @@ import { SlitterPlan, PlanningRun, VA05Order, PlanItem } from '../types';
 /**
  * Generates an Excel workbook for a single Slitter Plan matching GPAK/QR/PL/01
  */
-export function exportSinglePlanToExcel(plan: SlitterPlan): Uint8Array {
+export function exportSinglePlanToExcel(
+  plan: any,
+  forceMachine?: 'SS' | 'PS' | 'MSL'
+): Uint8Array {
   const wb = XLSX.utils.book_new();
-  const ws = createPlanWorksheet(plan);
-  XLSX.utils.book_append_sheet(wb, ws, plan.plan_number.slice(0, 31));
+  const meta = slitterPlanToFactoryMeta(plan, forceMachine);
+  const ws = createFactoryPlanWorksheet(meta);
+  const sheetName = String(meta.plan_title || plan.plan_number || 'Plan').slice(0, 31);
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
   return XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+}
+
+/** Style-exact single plan (colors/borders) — preferred for UI Export Excel */
+export async function exportSinglePlanToExcelStyled(
+  plan: any,
+  forceMachine?: 'SS' | 'PS' | 'MSL'
+): Promise<Uint8Array> {
+  const meta = slitterPlanToFactoryMeta(plan, forceMachine);
+  return writeFactoryPlansExcelJs([meta]);
 }
 
 /**
@@ -174,7 +188,8 @@ export function consolidatePlanItems(items: PlanItem[] = []): ConsolidatedPlanIt
 
   const map = new Map<string, PlanItem[]>();
 
-  items.forEach(item => {
+  const firstIndexByKey = new Map<string, number>();
+  items.forEach((item, idx) => {
     // FUTURE SHIFT only when engine marked a true size-change replacement.
     // start_pack > 1 alone (same size, different customer/SO/item) is NOT future shift.
     const isFuture = !!item.is_future_replacement;
@@ -189,6 +204,7 @@ export function consolidatePlanItems(items: PlanItem[] = []): ConsolidatedPlanIt
     const key = `${soClean}__${itemNumClean}__${custClean}__${w}__${l}__${c}__${ts}__${isFuture ? '1' : '0'}`;
     if (!map.has(key)) {
       map.set(key, []);
+      firstIndexByKey.set(key, idx); // preserve engine order (parent then its shifts)
     }
     map.get(key)!.push(item);
   });
@@ -340,72 +356,12 @@ export function consolidatePlanItems(items: PlanItem[] = []): ConsolidatedPlanIt
     });
   });
 
-  // Order rows so each FUTURE SHIFT sits directly under the active size/position
-  // it replaces (change-from size → change-to row immediately below).
-  const getPositions = (row: ConsolidatedPlanItemRow): number[] => {
-    const nums: number[] = [];
-    for (const it of row.raw_items || []) {
-      if (typeof it.position === 'number' && !isNaN(it.position)) nums.push(it.position);
-      if (Array.isArray((it as any).positions)) {
-        for (const p of (it as any).positions) {
-          if (typeof p === 'number') nums.push(p);
-        }
-      }
-    }
-    const label = row.position_label || '';
-    const matches = label.matchAll(/\d+/g);
-    for (const m of matches) {
-      const n = Number(m[0]);
-      if (!isNaN(n) && n > 0 && n < 100) nums.push(n);
-    }
-    return Array.from(new Set(nums));
-  };
-
-  const actives = consolidated.filter(r => !r.is_future_replacement);
-  const futures = consolidated.filter(r => !!r.is_future_replacement);
-
-  actives.sort((a, b) => {
-    const pa = getPositions(a);
-    const pb = getPositions(b);
-    const ma = pa.length ? Math.min(...pa) : 999;
-    const mb = pb.length ? Math.min(...pb) : 999;
-    if (ma !== mb) return ma - mb;
-    return (b.width_mm || 0) - (a.width_mm || 0);
-  });
-
-  const ordered: ConsolidatedPlanItemRow[] = [];
-  const usedFutureKeys = new Set<string>();
-
-  for (const active of actives) {
-    ordered.push(active);
-    const activePos = new Set(getPositions(active));
-    const activeW = Number(active.width_mm || 0);
-
-    const related = futures
-      .filter(f => {
-        if (usedFutureKeys.has(f.key)) return false;
-        const fPos = getPositions(f);
-        // Same physical arm/position → this shift belongs under that active row
-        if (fPos.some(p => activePos.has(p))) return true;
-        // Instruction "CHANGE SIZE {activeW}MM → ..."
-        const instr = `${f.replacement_instruction || ''} ${f.raw_items?.map(r => r.replacement_instruction || '').join(' ') || ''}`;
-        if (activeW > 0 && new RegExp(`CHANGE SIZE\\s*${activeW}\\s*MM`, 'i').test(instr)) return true;
-        // start_pack replacement on same SO chain under this width group
-        return false;
-      })
-      .sort((a, b) => (a.start_pack || 0) - (b.start_pack || 0) || (a.width_mm || 0) - (b.width_mm || 0));
-
-    for (const f of related) {
-      ordered.push(f);
-      usedFutureKeys.add(f.key);
-    }
-  }
-
-  for (const f of futures) {
-    if (!usedFutureKeys.has(f.key)) ordered.push(f);
-  }
-
-  return ordered.length > 0 ? ordered : consolidated;
+  // Keep engine order: each pack-1 UPS parent immediately followed by its knife shifts
+  // (deckleOptimizer already emits parent → replacements in sequence).
+  consolidated.sort(
+    (a, b) => (firstIndexByKey.get(a.key) ?? 0) - (firstIndexByKey.get(b.key) ?? 0)
+  );
+  return consolidated;
 }
 
 /**
@@ -642,12 +598,20 @@ function createFactoryPlanWorksheet(meta: FactorySheetMeta): XLSX.WorkSheet {
   return ws;
 }
 
-export function slitterPlanToFactoryMeta(plan: any): FactorySheetMeta {
+export function slitterPlanToFactoryMeta(plan: any, forceMachine?: 'SS' | 'PS' | 'MSL'): FactorySheetMeta {
   const consolidated = consolidatePlanItems(plan.items || []);
   const lines: FactoryLineRow[] = consolidated.map(it => {
-    const fut = !!it.is_future_replacement;
-    const ups = fut ? 0 : (it.ups || 0);
-    const deckleMm = fut ? 0 : (it.deckle_mm || (it.width_mm * Math.max(ups, 1)));
+    // FUTURE / not yet mounted: no UPS on initial layout → no DECKLE value
+    const fut =
+      !!it.is_future_replacement ||
+      Number(it.start_pack || 0) > 1 ||
+      (Number(it.ups || 0) <= 0 && Number(it.initial_ups || 0) <= 0 && !!it.replacement_instruction);
+    const activeUps = fut
+      ? 0
+      : Number(it.initial_ups !== undefined && it.initial_ups !== null ? it.initial_ups : (it.ups || 0));
+    const ups = activeUps;
+    // DECKLE column = only sizes with initial UPS (active pattern), never future widths
+    const deckleMm = !fut && ups > 0 ? Number(it.deckle_mm || it.width_mm * ups) : 0;
     const reels = Number(it.reels || 0); // FUTURE SHIFT still has reels on the sheet
     const tot = Number(it.total_weight_kg || 0);
     const reps = Math.max(1, Number(plan.repetitions || 1));
@@ -677,19 +641,35 @@ export function slitterPlanToFactoryMeta(plan: any): FactorySheetMeta {
   let machine_code = 'PS01';
   let machine_name = 'PRIMARY SLITTER 1';
   let doc_ref = plan.doc_ref || 'GPAK/QR/PL/01';
-  if (mid.includes('SS') || (plan.machine_name || '').toUpperCase().includes('SECONDARY')) {
-    machine_code = 'SS';
+  if (forceMachine === 'SS' || mid.includes('SS') || (plan.machine_name || '').toUpperCase().includes('SECONDARY')) {
+    machine_code = 'SS01';
     machine_name = 'SECONDARY SLITTER';
     doc_ref = plan.doc_ref || 'CPAK/QR/PL/01';
-  } else if (mid.includes('MSL') || mid.includes('METAL')) {
+  } else if (forceMachine === 'MSL' || mid.includes('MSL') || mid.includes('METAL')) {
     machine_code = 'MSL';
     machine_name = 'METALLIZER SLITTER';
     doc_ref = plan.doc_ref || 'CPAK/QR/PL/01';
+  } else if (forceMachine === 'PS') {
+    machine_code = 'PS01';
+    machine_name = 'PRIMARY SLITTER 1';
   }
 
-  const displayPlanNumber = String(plan.plan_number || plan.id || 'PLAN')
-    .replace(/\bPS01\b/g, 'PS')
-    .replace(/^PS01-/g, 'PS-');
+  // SS download: show SS01-… not PS1-/PS01-
+  let displayPlanNumber = String(plan.plan_number || plan.id || 'PLAN');
+  if (machine_code === 'SS01' || forceMachine === 'SS') {
+    displayPlanNumber = displayPlanNumber
+      .replace(/^PS1-/i, 'SS01-')
+      .replace(/^PS01-/i, 'SS01-')
+      .replace(/\bPS01\b/gi, 'SS01')
+      .replace(/\bPS1\b/gi, 'SS01');
+    if (!/^SS/i.test(displayPlanNumber)) {
+      displayPlanNumber = `SS01-${displayPlanNumber}`;
+    }
+  } else {
+    displayPlanNumber = displayPlanNumber
+      .replace(/\bPS01\b/g, 'PS')
+      .replace(/^PS01-/g, 'PS-');
+  }
 
   const changeInstructions = Array.isArray(plan.changes) && plan.changes.length
     ? plan.changes
@@ -755,7 +735,7 @@ export function ssOrMslPlanToFactoryMeta(plan: any, kind: 'SS' | 'MSL'): Factory
   const reps = Number(plan.repeat_count || plan.package_multiple || 1);
   return {
     plan_title: String(plan.plan_number || plan.id || kind),
-    machine_code: kind,
+    machine_code: kind === 'SS' ? 'SS01' : kind,
     machine_name: kind === 'SS' ? 'SECONDARY SLITTER' : 'METALLIZER SLITTER',
     film: plan.film || '',
     thickness_micron: Number(plan.thickness_micron || 0),
@@ -865,7 +845,7 @@ export function exportSSJumboRequirementsToExcel(reqs: any[]): Uint8Array {
   for (const req of reqs || []) {
     const psPlan = req.source_ps_plan || req._psPlan;
     if (psPlan && (psPlan.items || psPlan.plan_number)) {
-      pushMeta(slitterPlanToFactoryMeta(psPlan), String(psPlan.id || psPlan.plan_number));
+      pushMeta(slitterPlanToFactoryMeta(psPlan, 'SS'), String(psPlan.id || psPlan.plan_number));
       continue;
     }
     const orders = req.orders_covered || [];
@@ -966,10 +946,14 @@ export async function exportMSLPlansToExcelStyled(plans: any[]): Promise<Uint8Ar
   return writeFactoryPlansExcelJs(metas);
 }
 
-export async function exportAllFactoryPlansOnlyStyled(plans: SlitterPlan[]): Promise<Uint8Array> {
-  let metas = (plans && plans.length ? plans : []).map((p) => slitterPlanToFactoryMeta(p));
+export async function exportAllFactoryPlansOnlyStyled(
+  plans: SlitterPlan[],
+  opts?: { forceMachine?: 'SS' | 'PS' | 'MSL' }
+): Promise<Uint8Array> {
+  const fm = opts?.forceMachine;
+  let metas = (plans && plans.length ? plans : []).map((p) => slitterPlanToFactoryMeta(p, fm));
   if (metas.length === 0) {
-    metas = [slitterPlanToFactoryMeta({ plan_number: 'EMPTY', film: '', deckle_mm: 10400, items: [] })];
+    metas = [slitterPlanToFactoryMeta({ plan_number: 'EMPTY', film: '', deckle_mm: 10400, items: [] }, fm)];
   }
   return writeFactoryPlansExcelJs(metas);
 }
@@ -984,7 +968,7 @@ export async function exportSSJumboRequirementsToExcelStyled(reqs: any[]): Promi
       const key = String(psPlan.id || psPlan.plan_number);
       if (seen.has(key)) continue;
       seen.add(key);
-      metas.push(slitterPlanToFactoryMeta(psPlan));
+      metas.push(slitterPlanToFactoryMeta(psPlan, 'SS'));
       continue;
     }
     const orders = req.orders_covered || [];
