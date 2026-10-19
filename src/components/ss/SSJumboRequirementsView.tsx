@@ -1824,7 +1824,15 @@ export const SSJumboRequirementsView: React.FC<SSJumboRequirementsViewProps> = (
                               psPacksFromPlan ||
                               Number((req as any).ps_pack_count) ||
                               0;
-                            const totalPacks = psPacksCard > 0 ? psPacksCard : (req.required_rolls_count || 1) * setsPerJumbo;
+                            // Prefer sim total_packs_run / package_multiple×rolls (same as sheet)
+                            const simPacks = Number((req as any).total_packs_run) || 0;
+                            const pkgMultCard = Math.max(1, Number(req.package_multiple) || setsPerJumbo);
+                            const totalPacks =
+                              psPacksCard > 0
+                                ? psPacksCard
+                                : simPacks > 0
+                                  ? simPacks
+                                  : (req.required_rolls_count || 1) * pkgMultCard;
 
                             // Initial knife pattern = active (non-future) positions with UPS > 0
                             let displayCuts: number[] = (req.finished_widths_covered || []).slice();

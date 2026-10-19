@@ -877,15 +877,20 @@ export function generateMSLSlitterPlan(
   const packLengthM = coveredLengths.length > 0 
     ? Math.max(...coveredLengths) 
     : Math.round(jumboLengthM / Math.max(1, req.package_multiple || 1));
-  const setsPerJumbo = Math.max(1, Math.round(jumboLengthM / packLengthM));
-  const totalPacks = jumboRollsCount * setsPerJumbo;
+  const setsPerJumbo = Math.max(1, Math.round(jumboLengthM / Math.max(1, packLengthM)));
+  // Prefer simulation package_multiple × rolls (native SS coherent packs) over length-derived
+  const pkgMult = Math.max(1, Number(req.package_multiple) || setsPerJumbo);
+  const totalPacksFromSim = Number((req as any).total_packs_run) || 0;
+  const totalPacks = totalPacksFromSim > 0
+    ? totalPacksFromSim
+    : Math.max(1, jumboRollsCount * pkgMult);
 
   const planId = `msl-slitter-plan-${req.id || planIndex + 1}`;
   const widthSummary = finishedCuts.length <= 3 
     ? finishedCuts.join('+') + 'MM' 
     : `${finishedCuts.slice(0, 3).join('+')}+${finishedCuts.length - 3}MORE`;
-  const planNumber = `MSL-P${planIndex + 1}-${film}-${mountJumboWidth}MM-(${widthSummary})`;
-  const segmentId = `seg-msl-${planIndex + 1}-1`;
+  const planNumber = `SS-P${planIndex + 1}-${film}-${mountJumboWidth}MM-(${widthSummary})`;
+  const segmentId = `seg-ss-${planIndex + 1}-1`;
 
   // 1. Determine unique lengths from covered orders
   const uniqueLengths = Array.from(new Set(coveredLengths)).sort((a, b) => b - a);
@@ -1101,13 +1106,61 @@ export function generateMSLSlitterPlan(
   const millRollWeightKg = Number((singlePackMillRollWeightKg * totalPacks).toFixed(2));
   const trimWeightKg = Number((singlePackTrimWeightKg * totalPacks).toFixed(2));
   const wastePercent = Number(((trimMm / mountJumboWidth) * 100).toFixed(2));
+
+  // Native SS simulation knife-change log → FUTURE SHIFT + operator instructions
+  const simChanges: any[] = Array.isArray((req as any).size_change_log)
+    ? (req as any).size_change_log
+    : [];
+  if (simChanges.length > 0) {
+    for (const sc of simChanges) {
+      const afterPack = Math.max(0, Number(sc.after_pack) || 0);
+      const oldW = Number(sc.old_width_mm) || 0;
+      const newW = Number(sc.new_width_mm) || 0;
+      if (afterPack <= 0 || !oldW || !newW || oldW === newW) continue;
+      const instr =
+        sc.instruction ||
+        `AFTER PACK ${afterPack}: CHANGE SIZE ${oldW}MM → ${newW}MM`;
+      changes.push({
+        id: `change-${planId}-sim-${afterPack}-${sc.position}-${oldW}-${newW}`,
+        plan_id: planId,
+        segment_id: segmentId,
+        position: Number(sc.position) || 1,
+        old_width_mm: oldW,
+        new_width_mm: newW,
+        after_pack: afterPack,
+        reason: 'ORDER_COMPLETED',
+        instruction: instr,
+        old_order_ref: sc.old_order_ref || '',
+        new_order_ref: sc.new_order_ref || '',
+        created_at: dateStr,
+      });
+      // Label items that start after this change as FUTURE SHIFT (size change)
+      for (const it of items) {
+        if (Number(it.width_mm) === newW && Number(it.start_pack || 1) > 1) {
+          it.is_future_replacement = true;
+          it.ups = 0;
+          it.initial_ups = 0;
+          it.replacement_instruction = instr;
+        }
+      }
+    }
+    // de-dupe
+    const seenCh = new Set<string>();
+    for (let i = changes.length - 1; i >= 0; i--) {
+      const c = changes[i];
+      const k = `${c.after_pack}|${c.position}|${c.old_width_mm}|${c.new_width_mm}`;
+      if (seenCh.has(k)) changes.splice(i, 1);
+      else seenCh.add(k);
+    }
+  }
+
   const totalReelsCount = items.reduce((sum, item) => sum + item.reels, 0);
 
   const segment: PlanSegment = {
     id: segmentId,
     plan_id: planId,
     segment_number: 1,
-    name: `MSL Finished Slit Pattern (${mslUps}-UPS on ${mountJumboWidth}mm Jumbo Mount)`,
+    name: `SS Finished Slit Pattern (${mslUps}-UPS on ${mountJumboWidth}mm Jumbo Mount)`,
     start_pack: 1,
     end_pack: totalPacks,
     repetitions: totalPacks,
@@ -1129,8 +1182,8 @@ export function generateMSLSlitterPlan(
     id: planId,
     planning_run_id: `run-msl-${film}`,
     plan_number: planNumber,
-    machine_id: 'MSL',
-    machine_name: 'METALLIZER SLITTER (MSL)',
+    machine_id: 'SS01',
+    machine_name: 'SECONDARY SLITTER',
     film: film,
     thickness_micron: thickness,
     density: density,
@@ -1143,7 +1196,7 @@ export function generateMSLSlitterPlan(
     max_ups_capacity: 16,
     repetitions: totalPacks,
     length_m: packLengthM,
-    planned_mr_length_m: packLengthM,
+    planned_mr_length_m: packLengthM * totalPacks,
     mill_roll_weight_kg: millRollWeightKg,
     trim_weight_kg: trimWeightKg,
     waste_percent: wastePercent,
@@ -1164,7 +1217,7 @@ export function generateMSLSlitterPlan(
       side_b_length_m: sideBLen,
       balance_delta: Math.abs(actualSideAUps - actualSideBUps),
     },
-    doc_ref: 'APS/QR/MSL/01',
+    doc_ref: 'APS/QR/SS/01',
     rev_no: 0,
     issue_date: displayDate,
     items: items,

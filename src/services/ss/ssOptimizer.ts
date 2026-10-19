@@ -1441,6 +1441,7 @@ function optimizeDemandPool(
         length_m: number;
         required_reels: number;
         weight_kg: number;
+        ups?: number;
       }>();
 
       const filmKeyCand = String(cand.film || '').trim().toUpperCase();
@@ -1476,7 +1477,19 @@ function optimizeDemandPool(
         // Prefer true package length from pattern
         const pkgLenGuess =
           orderTrackers.find(t => positionWidths.includes(t.order.width_mm))?.pkgLength || 3600;
-        const packsPerJumbo = Math.max(1, Math.round(jumboLen / pkgLenGuess));
+        const packsPerJumbo = Math.max(1, Math.round(jumboLen / Math.max(1, pkgLenGuess)));
+        let totalPacksAllRolls = 0;
+        const sizeChangeLog: Array<{
+          after_pack: number;
+          position: number;
+          old_width_mm: number;
+          new_width_mm: number;
+          old_order_id?: string;
+          new_order_id: string;
+          old_order_ref?: string;
+          new_order_ref: string;
+          instruction: string;
+        }> = [];
 
         // Seed each position with best same-width tracker
         type PosState = { width: number; tracker: OrderTracker | null };
@@ -1571,16 +1584,36 @@ function optimizeDemandPool(
                   packOk = false;
                   break;
                 }
+                const prevW = positions[pi].width;
+                const prevTr = positions[pi].tracker;
                 positions[pi] = { width: rep.width, tracker: rep.tracker };
                 widthsPack[pi] = rep.width;
+                if (prevW !== rep.width) {
+                  const afterPack = totalPacksAllRolls + packsRunThisJumbo; // packs completed before this pack
+                  sizeChangeLog.push({
+                    after_pack: Math.max(0, afterPack),
+                    position: pi + 1,
+                    old_width_mm: prevW,
+                    new_width_mm: rep.width,
+                    old_order_id: prevTr?.order?.id,
+                    new_order_id: rep.tracker.order.id,
+                    old_order_ref: prevTr
+                      ? `SO# ${prevTr.order.sales_order} / Item ${prevTr.order.item_number}`
+                      : undefined,
+                    new_order_ref: `SO# ${rep.tracker.order.sales_order} / Item ${rep.tracker.order.item_number} (${rep.tracker.order.customer})`,
+                    instruction: `AFTER PACK ${Math.max(0, afterPack)}: CHANGE SIZE ${prevW}MM → ${rep.width}MM`,
+                  });
+                }
               }
             }
             if (!packOk) break;
 
-            // Commit one pack to every position
+            // Commit one pack to every position — count concurrent UPS per order this pack
+            const upsThisPack = new Map<string, number>();
             for (let pi = 0; pi < positions.length; pi++) {
               const pos = positions[pi];
               const tr = pos.tracker!;
+              upsThisPack.set(tr.order.id, (upsThisPack.get(tr.order.id) || 0) + 1);
               const wpr = weightKg(pos.width, tr.pkgLength);
               tr.allocatedKg = Number((tr.allocatedKg + wpr).toFixed(2));
               tr.remainingKg = Math.max(
@@ -1598,7 +1631,9 @@ function optimizeDemandPool(
               if (existingCov) {
                 existingCov.required_reels += 1;
                 existingCov.weight_kg = Number((existingCov.weight_kg + wpr).toFixed(2));
-                // width may have changed via size-change — keep dominant width
+                existingCov.ups = Math.max(existingCov.ups || 0, upsThisPack.get(tr.order.id) || 1);
+                // Prefer latest physical width on this order after size-change
+                existingCov.width_mm = pos.width;
               } else {
                 ordersCoveredMap.set(tr.order.id, {
                   order_id: tr.order.id,
@@ -1609,6 +1644,7 @@ function optimizeDemandPool(
                   length_m: tr.pkgLength,
                   required_reels: 1,
                   weight_kg: Number(wpr.toFixed(2)),
+                  ups: upsThisPack.get(tr.order.id) || 1,
                 });
               }
             }
@@ -1616,10 +1652,21 @@ function optimizeDemandPool(
           }
 
           if (packsRunThisJumbo <= 0) break;
+          totalPacksAllRolls += packsRunThisJumbo;
           rollsRun++;
         }
 
-        effectiveRolls = Math.max(1, rollsRun);
+        // Only count rolls that actually ran packs; do not invent a phantom roll
+        effectiveRolls = rollsRun;
+        // Coherent package_multiple = actual packs/roll from simulation (not candidate guess)
+        if (rollsRun > 0 && totalPacksAllRolls > 0) {
+          (cand as any)._actualPackageMultiple = Math.max(
+            1,
+            Math.round(totalPacksAllRolls / rollsRun)
+          );
+        }
+        (cand as any)._sizeChangeLog = sizeChangeLog;
+        (cand as any)._totalPacksAllRolls = totalPacksAllRolls;
         // Pattern widths: use final position widths (after size-changes) if stable,
         // else original combo — sheet uses finished_widths_covered from combo
       } else {
@@ -1684,6 +1731,10 @@ function optimizeDemandPool(
       const uniqueInDeckle = new Set(winning.jumboWidths).size;
       const deckleTypeDesc = uniqueInDeckle === 1 ? 'Uniform' : uniqueInDeckle === 2 ? '2-Width Mixed' : uniqueInDeckle === 3 ? '3-Width Mixed' : '4-Width Mixed';
 
+      if (isFixed1700Film && effectiveRolls <= 0) {
+        continue; // simulation produced nothing — do not emit empty/mismatched req
+      }
+
       finalRequirements.push({
         id: `req-ss-${reqCounter++}`,
         film: cand.film || groupLabel,
@@ -1698,8 +1749,20 @@ function optimizeDemandPool(
         expected_trim_mm: actualTrim,
         trim_width_mm: actualTrim,
         orders_covered: Array.from(ordersCoveredMap.values()),
-        package_multiple: cand.packageMultiple,
-        total_weight_kg: totalWeightKg,
+        size_change_log: isFixed1700Film ? ((cand as any)._sizeChangeLog || []) : undefined,
+        total_packs_run: isFixed1700Film
+          ? Number((cand as any)._totalPacksAllRolls) || undefined
+          : undefined,
+        package_multiple: isFixed1700Film
+          ? Math.max(1, Number((cand as any)._actualPackageMultiple) || cand.packageMultiple || 1)
+          : cand.packageMultiple,
+        total_weight_kg: isFixed1700Film
+          ? Number(
+              Array.from(ordersCoveredMap.values())
+                .reduce((s, c) => s + Number(c.weight_kg || 0), 0)
+                .toFixed(2)
+            ) || totalWeightKg
+          : totalWeightKg,
         efficiency_percent: Number(((cand.combo.sumWidth / cand.jumboWidth) * 100).toFixed(1)),
         planning_mode: filmsInGroup.length > 1 ? 'COMBINED' : 'SINGLE',
         compatible_group_key: groupLabel,
@@ -2233,7 +2296,7 @@ export function generateSSPlans(
       );
       const remBefore = liveOrd ? liveOrd.remaining_qty : 0;
       const plannedWeight = Number((cov.weight_kg * rollRatio).toFixed(2));
-      const plannedReels = Math.round(cov.required_reels * rollRatio);
+      let plannedReels = Math.max(0, Math.round(Number(cov.required_reels || 0) * rollRatio));
       const remAfter = liveOrd ? Math.max(0, Number((remBefore - plannedWeight).toFixed(2))) : 0;
 
       if (liveOrd) {
@@ -2244,7 +2307,19 @@ export function generateSSPlans(
 
       planTotalPlannedWeightKg += plannedWeight;
 
-      const orderUps = (req.finished_widths_covered || []).filter(w => w === cov.width_mm).length || 1;
+      // Prefer simulation-tracked concurrent UPS; fallback to pattern width count
+      const orderUps = Math.max(
+        1,
+        Number((cov as any).ups) ||
+          (req.finished_widths_covered || []).filter((w: number) => w === cov.width_mm).length ||
+          1
+      );
+      // Coherence: reels should be ups × packs × rolls when continuous; keep simulation reels as source of truth
+      // but never show 0 reels with positive weight
+      if (plannedReels <= 0 && plannedWeight > 0.01) {
+        const pkgMult = Math.max(1, req.package_multiple || 1);
+        plannedReels = Math.max(1, orderUps * pkgMult * Math.max(1, Math.round(rollCount)));
+      }
 
       return {
         order_id: cov.order_id || liveOrd?.id || '',
@@ -2255,7 +2330,7 @@ export function generateSSPlans(
         length_m: cov.length_m,
         ups: orderUps,
         planned_reels: plannedReels,
-        weight_per_reel_kg: plannedReels > 0 ? Number((plannedWeight / plannedReels).toFixed(2)) : 0,
+        weight_per_reel_kg: plannedReels > 0 ? Number((plannedWeight / plannedReels).toFixed(3)) : 0,
         planned_weight_kg: plannedWeight,
         weight_kg: plannedWeight,
         remaining_before_kg: remBefore,
