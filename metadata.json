@@ -1,0 +1,6 @@
+{
+  "name": "PlanneX",
+  "description": "PlanneX - Your Deterministic Planning Co-Worker. Deterministic Deckle Optimization & Production Planning Suite for industrial film manufacturing, supporting Primary Slitter (PS01), Metallizer Slitter (MSL), and Secondary Slitter (SS) modules.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
