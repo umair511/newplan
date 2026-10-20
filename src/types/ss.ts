@@ -98,7 +98,21 @@ export interface SSJumboRequirement {
     length_m: number;
     required_reels: number;
     weight_kg: number;
+    core?: string | number;
+    treatment_side?: string;
+    start_pack?: number;
+    ups?: number;
   }[];
+  size_change_log?: Array<{
+    after_pack: number;
+    position: number;
+    old_width_mm: number;
+    new_width_mm: number;
+    instruction?: string;
+    old_order_ref?: string;
+    new_order_ref?: string;
+  }>;
+  total_packs_run?: number;
   package_multiple: number;
   total_weight_kg: number;
   efficiency_percent: number;

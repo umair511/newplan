@@ -5,7 +5,7 @@ import { findFilmsMissingDensity, getFilmSpecsSnapshotForPlanning } from '../ser
 import type { WorkerMessageResponse } from '../services/optimizer/optimizer.worker';
 import OptimizerWorker from '../services/optimizer/optimizer.worker?worker&inline';
 import { commitPlanningRun, getOrdersLedgerFingerprint , saveStoredRules} from '../services/storage';
-import { exportCompleteRunToExcel, exportAllPlansToExcel, exportAllFactoryPlansOnlyStyled, downloadExcelBuffer } from '../services/excelExporter';
+import { exportCompleteRunToExcelStyled, exportAllPlansToExcelStyled, exportAllFactoryPlansOnlyStyled, downloadExcelBuffer } from '../services/excelExporter';
 import { FILM_MASTERS } from '../services/masterData';
 import { RemainingOrdersTable } from './RemainingOrdersTable';
 import { 
@@ -433,7 +433,7 @@ export const PlanGeneratorStudio: React.FC<PlanGeneratorStudioProps> = ({
   const handleDownloadRunExcel = async () => {
     if (!optResult) return;
     // One .xlsx file: Summary + Plan1 sheet + Plan2 sheet + … + Remaining
-    const excelBuffer = exportAllPlansToExcel(optResult.run, optResult.plans, optResult.remaining_orders);
+    const excelBuffer = await exportAllPlansToExcelStyled(optResult.run, optResult.plans, optResult.remaining_orders);
     downloadExcelBuffer(
       excelBuffer,
       `All_Plans_${optResult.run.run_number || 'PS'}_${optResult.plans.length}plans.xlsx`

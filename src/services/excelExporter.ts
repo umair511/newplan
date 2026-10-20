@@ -598,6 +598,44 @@ function createFactoryPlanWorksheet(meta: FactorySheetMeta): XLSX.WorkSheet {
   return ws;
 }
 
+
+/** SS / factory sheet header: pack length + pack count (never jumbo mother length / roll count). */
+function resolveSsPackLengthAndReps(plan: any, lines?: { length_m?: number }[]): { length_m: number; reps: number } {
+  const itemLens = (lines || plan?.items || plan?.orders_covered || [])
+    .map((x: any) => Number(x.length_m || x.length || 0))
+    .filter((n: number) => Number.isFinite(n) && n > 0);
+  const orderPackLen = itemLens.length ? Math.max(...itemLens) : 0;
+
+  // Prefer explicit package / slit length fields over jumbo mother length
+  let length_m = Number(
+    plan?.package_length_m ||
+    plan?.length_m ||
+    orderPackLen ||
+    0
+  );
+  // If length_m is clearly a multi-pack mother (>> single order length), use order pack length
+  if (orderPackLen > 0 && length_m > orderPackLen * 1.5) {
+    length_m = orderPackLen;
+  }
+  // Never use required_jumbo_length_m / jumbo_length_m as LENGTH when order length exists
+  if (orderPackLen > 0 && (length_m <= 0 || length_m === Number(plan?.jumbo_length_m) || length_m === Number(plan?.required_jumbo_length_m))) {
+    length_m = orderPackLen;
+  }
+
+  const simPacks = Number(plan?.total_packs_run || plan?.repetitions || 0);
+  const pkgMult = Number(plan?.package_multiple || 0);
+  const rolls = Number(plan?.required_rolls_count || plan?.repeat_count || plan?.jumbo_rolls_count || 0);
+  let reps = 0;
+  if (simPacks > 0) reps = simPacks;
+  else if (Number(plan?.repetitions) > 0) reps = Number(plan.repetitions);
+  else if (pkgMult > 0 && rolls > 0) reps = pkgMult * rolls;
+  else if (pkgMult > 0) reps = pkgMult;
+  else if (rolls > 0) reps = rolls;
+  else reps = 1;
+
+  return { length_m: length_m || 0, reps: Math.max(1, Math.round(reps)) };
+}
+
 export function slitterPlanToFactoryMeta(plan: any, forceMachine?: 'SS' | 'PS' | 'MSL'): FactorySheetMeta {
   const consolidated = consolidatePlanItems(plan.items || []);
   const lines: FactoryLineRow[] = consolidated.map(it => {
@@ -692,8 +730,10 @@ export function slitterPlanToFactoryMeta(plan: any, forceMachine?: 'SS' | 'PS' |
     film: plan.film || (plan.films && plan.films[0]) || '',
     thickness_micron: Number(plan.thickness_micron || 0),
     density: Number(plan.density || 0),
-    length_m: Number(plan.length_m || 0),
-    reps: Number(plan.repetitions || 1),
+    ...(() => {
+      const pr = resolveSsPackLengthAndReps(plan, lines);
+      return { length_m: pr.length_m, reps: pr.reps };
+    })(),
     deckle_mm: Number(plan.deckle_mm || plan.jumbo_width_mm || 0),
     utilized_web_mm: Number(plan.total_slit_width_mm || 0) || undefined,
     allowed_trim_mm: Number(plan.allowed_trim_mm ?? plan.trim_mm ?? 25),
@@ -732,7 +772,7 @@ export function ssOrMslPlanToFactoryMeta(plan: any, kind: 'SS' | 'MSL'): Factory
     };
   });
 
-  const reps = Number(plan.repeat_count || plan.package_multiple || 1);
+  const pr = resolveSsPackLengthAndReps(plan, lines);
   return {
     plan_title: String(plan.plan_number || plan.id || kind),
     machine_code: kind === 'SS' ? 'SS01' : kind,
@@ -740,8 +780,8 @@ export function ssOrMslPlanToFactoryMeta(plan: any, kind: 'SS' | 'MSL'): Factory
     film: plan.film || '',
     thickness_micron: Number(plan.thickness_micron || 0),
     density: Number(plan.density || 0.91),
-    length_m: Number(plan.package_length_m || plan.jumbo_length_m || 0),
-    reps,
+    length_m: pr.length_m,
+    reps: pr.reps,
     deckle_mm: Number(plan.jumbo_width_mm || 0),
     utilized_web_mm: Number(plan.total_slit_width_mm || 0) || undefined,
     allowed_trim_mm: Number(plan.trim_mm || 25),
@@ -830,6 +870,139 @@ export function exportAllFactoryPlansOnly(plans: SlitterPlan[]): Uint8Array {
  * SS Jumbo Requirements / Planner Selection → factory sample sheets.
  * Prefer linked PS engine SlitterPlan; else build sheet from requirement orders.
  */
+
+/**
+ * Native SS requirement → factory lines.
+ * - UPS + DECKLE only on initial (pack-1) sizes
+ * - Later SO/item/knife shifts: is_future, blank UPS/DECKLE, ordered under parent size
+ */
+function buildSsRequirementFactoryLines(req: any): FactoryLineRow[] {
+  const orders: any[] = Array.isArray(req?.orders_covered) ? [...req.orders_covered] : [];
+  const changeLog: any[] = Array.isArray(req?.size_change_log) ? [...req.size_change_log] : [];
+  let pattern: number[] = Array.isArray(req?.finished_widths_covered)
+    ? req.finished_widths_covered.map((w: any) => Number(w)).filter((n: number) => n > 0)
+    : [];
+
+  // Fallback pattern: one slot per distinct width (stable 1-UPS)
+  if (pattern.length === 0) {
+    const seenW = new Set<number>();
+    for (const o of orders) {
+      const w = Number(o.width_mm || 0);
+      if (w > 0 && !seenW.has(w)) {
+        seenW.add(w);
+        pattern.push(w);
+      }
+    }
+  }
+
+  const patternBudget = new Map<number, number>();
+  for (const w of pattern) {
+    patternBudget.set(w, (patternBudget.get(w) || 0) + 1);
+  }
+
+  orders.sort((a, b) => {
+    const sa = Math.max(1, Number(a.start_pack || 1));
+    const sb = Math.max(1, Number(b.start_pack || 1));
+    if (sa !== sb) return sa - sb;
+    return Number(b.required_reels || b.planned_reels || 0) - Number(a.required_reels || a.planned_reels || 0);
+  });
+
+  const patternUsed = new Map<number, number>();
+  type Row = FactoryLineRow & { _start?: number; _key?: string; _fromWidth?: number };
+  const rows: Row[] = [];
+
+  const formatCore = (raw: any): string => {
+    if (raw == null || raw === '') return '';
+    const s = String(raw).trim();
+    if (/steel/i.test(s)) return '';
+    const n = parseInt(s.replace(/[^0-9]/g, ''), 10);
+    if (n === 3 || n === 6) return `${n}"`;
+    return s;
+  };
+
+  for (const o of orders) {
+    const w = Number(o.width_mm || 0);
+    const reels = Number(o.required_reels || o.planned_reels || 0);
+    const wt = Number(o.weight_kg || o.planned_weight_kg || 0);
+    const start = Math.max(1, Number(o.start_pack || 1));
+    const budget = patternBudget.get(w) || 0;
+    const used = patternUsed.get(w) || 0;
+
+    let isFuture = start > 1;
+    if (!isFuture && budget > 0 && used >= budget) isFuture = true;
+
+    // UPS only for pack-1; cap by pattern slots — never 2 if pattern has one 330
+    let ups = 0;
+    if (!isFuture) {
+      const remain = budget > 0 ? Math.max(0, budget - used) : 1;
+      ups = remain > 0 ? Math.min(Math.max(1, Number(o.ups || 1)), remain) : 1;
+      if (budget === 1) ups = 1;
+      if (budget <= 0) ups = 1;
+      patternUsed.set(w, used + ups);
+    }
+
+    let fromWidth = 0;
+    for (const c of changeLog) {
+      if (Number(c.new_width_mm) === w) {
+        fromWidth = Number(c.old_width_mm) || 0;
+        break;
+      }
+    }
+
+    rows.push({
+      sales_order: o.sales_order,
+      item_number: o.item_number,
+      customer: o.customer || '',
+      length_m: Number(o.length_m || 0),
+      core: formatCore(o.core),
+      treatment_side: o.treatment_side || '',
+      width_mm: w,
+      reels,
+      weight_kg: wt,
+      size_mm: w,
+      ups,
+      deckle_mm: isFuture ? 0 : w * ups,
+      wt_pack_kg: isFuture ? 0 : Number((wt / Math.max(reels, 1)).toFixed(3)),
+      tot_wt_kg: Number(Number(wt).toFixed(3)),
+      is_future: isFuture,
+      _start: start,
+      _key: `${o.sales_order}|${o.item_number}|${w}|${start}`,
+      _fromWidth: fromWidth,
+    });
+  }
+
+  const actives = rows.filter(r => !r.is_future);
+  const futures = rows.filter(r => !!r.is_future);
+  const ordered: Row[] = [];
+  const usedF = new Set<string>();
+
+  for (const a of actives) {
+    ordered.push(a);
+    const related = futures
+      .filter(f => {
+        if (usedF.has(f._key || '')) return false;
+        if (f._fromWidth && f._fromWidth === Number(a.width_mm)) return true;
+        if (Number(f.width_mm) === Number(a.width_mm)) return true;
+        return changeLog.some(
+          (c: any) =>
+            Number(c.old_width_mm) === Number(a.width_mm) &&
+            Number(c.new_width_mm) === Number(f.width_mm)
+        );
+      })
+      .sort((x, y) => (x._start || 0) - (y._start || 0));
+    for (const f of related) {
+      ordered.push(f);
+      usedF.add(f._key || '');
+    }
+  }
+  for (const f of futures) {
+    if (!usedF.has(f._key || '')) ordered.push(f);
+  }
+
+  return ordered.map(({ _start, _key, _fromWidth, ...rest }) => rest);
+}
+
+
 export function exportSSJumboRequirementsToExcel(reqs: any[]): Uint8Array {
   const wb = XLSX.utils.book_new();
   const seen = new Set<string>();
@@ -848,29 +1021,7 @@ export function exportSSJumboRequirementsToExcel(reqs: any[]): Uint8Array {
       pushMeta(slitterPlanToFactoryMeta(psPlan, 'SS'), String(psPlan.id || psPlan.plan_number));
       continue;
     }
-    const orders = req.orders_covered || [];
-    const lines: FactoryLineRow[] = orders.map((o: any) => {
-      const w = Number(o.width_mm || 0);
-      const reels = Number(o.required_reels || o.planned_reels || 1);
-      const wt = Number(o.weight_kg || o.planned_weight_kg || 0);
-      const ups = Math.max(1, Number(o.ups || 1));
-      return {
-        sales_order: o.sales_order,
-        item_number: o.item_number,
-        customer: o.customer || '',
-        length_m: Number(o.length_m || req.required_jumbo_length_m || 0),
-        core: o.core ?? req.core ?? '',
-        treatment_side: o.treatment_side || '',
-        width_mm: w,
-        reels,
-        weight_kg: wt,
-        size_mm: w,
-        ups,
-        deckle_mm: w * ups,
-        wt_pack_kg: Number((wt / Math.max(reels, 1)).toFixed(3)),
-        tot_wt_kg: Number(wt.toFixed(3)),
-      };
-    });
+    const lines: FactoryLineRow[] = buildSsRequirementFactoryLines(req);
     // If no order lines, still emit header-only sheet with jumbo summary row
     if (lines.length === 0 && (req.finished_widths_covered || []).length) {
       for (const w of req.finished_widths_covered) {
@@ -878,7 +1029,7 @@ export function exportSSJumboRequirementsToExcel(reqs: any[]): Uint8Array {
           sales_order: '',
           item_number: '',
           customer: 'FOR SECONDARY SLITTER',
-          length_m: Number(req.required_jumbo_length_m || 0),
+          length_m: 0,
           core: req.core || '',
           treatment_side: '',
           width_mm: Number(w),
@@ -893,6 +1044,28 @@ export function exportSSJumboRequirementsToExcel(reqs: any[]): Uint8Array {
       }
     }
     const title = String(req.plan_number || req.id || `SS-JR-${sheetIdx + 1}`);
+    const deckleMm = Number(req.required_jumbo_width_mm || 1705);
+    const utilizedFromLines = lines
+      .filter((l) => !l.is_future)
+      .reduce(
+        (s, l) => s + (Number(l.deckle_mm) || (Number(l.width_mm) || 0) * (Number(l.ups) || 0)),
+        0
+      );
+    const trimFromPattern = Math.max(0, deckleMm - utilizedFromLines);
+    const expectedTrim = Number(req.expected_trim_mm ?? req.trim_width_mm);
+    const allowedTrim =
+      Number.isFinite(expectedTrim) && expectedTrim >= 0 && expectedTrim < 200
+        ? expectedTrim
+        : trimFromPattern;
+    const changeInstr = (Array.isArray(req.size_change_log) ? req.size_change_log : [])
+      .map(
+        (c: any) =>
+          c.instruction ||
+          `AFTER PACK ${c.after_pack}: CHANGE SIZE ${c.old_width_mm}MM → ${c.new_width_mm}MM`
+      )
+      .filter(Boolean)
+      .join('  |  ');
+    const pr = resolveSsPackLengthAndReps(req, lines);
     pushMeta({
       plan_title: title,
       machine_code: 'SS',
@@ -900,12 +1073,13 @@ export function exportSSJumboRequirementsToExcel(reqs: any[]): Uint8Array {
       film: req.film || '',
       thickness_micron: Number(req.thickness_micron || 0),
       density: Number(req.density || 0.91),
-      length_m: Number(req.required_jumbo_length_m || 0),
-      reps: Number(req.required_rolls_count || req.package_multiple || 1),
-      deckle_mm: Number(req.required_jumbo_width_mm || 1700),
-      utilized_web_mm: Number(req.total_slit_width_mm || 0) || undefined,
-      allowed_trim_mm: Number(req.expected_trim_mm || req.trim_width_mm || 25),
+      length_m: pr.length_m,
+      reps: pr.reps,
+      deckle_mm: deckleMm,
+      utilized_web_mm: utilizedFromLines > 0 ? utilizedFromLines : undefined,
+      allowed_trim_mm: allowedTrim,
       doc_ref: 'CPAK/QR/PL/01',
+      change_instructions: changeInstr || undefined,
       lines,
     }, title);
   }
@@ -930,6 +1104,41 @@ export function exportSSJumboRequirementsToExcel(reqs: any[]): Uint8Array {
 
 
 /** Style-exact factory export (colors, borders, merges) — preferred for Download All */
+
+/** Download All — every plan = same factory sample sheet (PS / SS / MSL). */
+export async function exportCompleteRunToExcelStyled(
+  runOrPlans: any,
+  plansMaybe?: SlitterPlan[] | { forceMachine?: 'SS' | 'PS' | 'MSL' },
+  _remaining?: any,
+  opts?: { forceMachine?: 'SS' | 'PS' | 'MSL' }
+): Promise<Uint8Array> {
+  // Overloads:
+  //   (plans[])
+  //   (plans[], opts)
+  //   (run, plans[], remaining?, opts?)
+  let plans: SlitterPlan[] = [];
+  let force: { forceMachine?: 'SS' | 'PS' | 'MSL' } | undefined = opts;
+  if (Array.isArray(runOrPlans)) {
+    plans = runOrPlans;
+    if (plansMaybe && !Array.isArray(plansMaybe) && typeof plansMaybe === 'object') {
+      force = plansMaybe as any;
+    }
+  } else if (Array.isArray(plansMaybe)) {
+    plans = plansMaybe;
+  }
+  return exportAllFactoryPlansOnlyStyled(plans || [], force);
+}
+
+/** Alias: Download All Plans always uses factory sample format. */
+export async function exportAllPlansToExcelStyled(
+  _run: any,
+  plans: SlitterPlan[],
+  _remaining?: any,
+  opts?: { forceMachine?: 'SS' | 'PS' | 'MSL' }
+): Promise<Uint8Array> {
+  return exportAllFactoryPlansOnlyStyled(plans || [], opts);
+}
+
 export async function exportSSPlansToExcelStyled(plans: any[]): Promise<Uint8Array> {
   let metas = (plans && plans.length ? plans : []).map((p) => ssOrMslPlanToFactoryMeta(p, 'SS'));
   if (metas.length === 0) {
@@ -971,32 +1180,32 @@ export async function exportSSJumboRequirementsToExcelStyled(reqs: any[]): Promi
       metas.push(slitterPlanToFactoryMeta(psPlan, 'SS'));
       continue;
     }
-    const orders = req.orders_covered || [];
-    const lines: FactoryLineRow[] = orders.map((o: any) => {
-      const w = Number(o.width_mm || 0);
-      const reels = Number(o.required_reels || o.planned_reels || 1);
-      const wt = Number(o.weight_kg || o.planned_weight_kg || 0);
-      const ups = Math.max(1, Number(o.ups || 1));
-      return {
-        sales_order: o.sales_order,
-        item_number: o.item_number,
-        customer: o.customer || '',
-        length_m: Number(o.length_m || req.required_jumbo_length_m || 0),
-        core: o.core ?? req.core ?? '',
-        treatment_side: o.treatment_side || '',
-        width_mm: w,
-        reels,
-        weight_kg: wt,
-        size_mm: w,
-        ups,
-        deckle_mm: w * ups,
-        wt_pack_kg: Number((wt / Math.max(reels, 1)).toFixed(3)),
-        tot_wt_kg: Number(wt.toFixed(3)),
-      };
-    });
+    const lines: FactoryLineRow[] = buildSsRequirementFactoryLines(req);
     const title = String(req.plan_number || req.id || `SS-JR-${metas.length + 1}`);
     if (seen.has(title)) continue;
     seen.add(title);
+    const deckleMm = Number(req.required_jumbo_width_mm || 1705);
+    const utilizedFromLines = lines
+      .filter((l) => !l.is_future)
+      .reduce(
+        (s, l) => s + (Number(l.deckle_mm) || (Number(l.width_mm) || 0) * (Number(l.ups) || 0)),
+        0
+      );
+    const trimFromPattern = Math.max(0, deckleMm - utilizedFromLines);
+    const expectedTrim = Number(req.expected_trim_mm ?? req.trim_width_mm);
+    const allowedTrim =
+      Number.isFinite(expectedTrim) && expectedTrim >= 0 && expectedTrim < 200
+        ? expectedTrim
+        : trimFromPattern;
+    const changeInstr = (Array.isArray(req.size_change_log) ? req.size_change_log : [])
+      .map(
+        (c: any) =>
+          c.instruction ||
+          `AFTER PACK ${c.after_pack}: CHANGE SIZE ${c.old_width_mm}MM → ${c.new_width_mm}MM`
+      )
+      .filter(Boolean)
+      .join('  |  ');
+    const pr = resolveSsPackLengthAndReps(req, lines);
     metas.push({
       plan_title: title,
       machine_code: 'SS',
@@ -1004,12 +1213,13 @@ export async function exportSSJumboRequirementsToExcelStyled(reqs: any[]): Promi
       film: req.film || '',
       thickness_micron: Number(req.thickness_micron || 0),
       density: Number(req.density || 0.91),
-      length_m: Number(req.required_jumbo_length_m || 0),
-      reps: Number(req.required_rolls_count || req.package_multiple || 1),
-      deckle_mm: Number(req.required_jumbo_width_mm || 1700),
-      utilized_web_mm: Number(req.total_slit_width_mm || 0) || undefined,
-      allowed_trim_mm: Number(req.expected_trim_mm || req.trim_width_mm || 25),
+      length_m: pr.length_m,
+      reps: pr.reps,
+      deckle_mm: deckleMm,
+      utilized_web_mm: utilizedFromLines > 0 ? utilizedFromLines : undefined,
+      allowed_trim_mm: allowedTrim,
       doc_ref: 'CPAK/QR/PL/01',
+      change_instructions: changeInstr || undefined,
       lines,
     });
   }

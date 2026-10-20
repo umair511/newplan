@@ -82,6 +82,33 @@ function setValue(cell: any, value: string | number | null | undefined) {
   cell.value = value;
 }
 
+
+/** Match sub-header light blue (FILM/LENGTH rows) — no purple title bar */
+const FACTORY_HEADER_LIGHT_BLUE = 'FFBDD7EE';
+
+function applyTitleBannerLightBlue(ws: any): void {
+  // Template title strip is row 1 (plan name + machine labels)
+  for (let col = 1; col <= 18; col++) {
+    const cell = ws.getCell(1, col);
+    try {
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: FACTORY_HEADER_LIGHT_BLUE },
+      };
+      // Keep text readable on light blue
+      const prev = cell.font || {};
+      cell.font = {
+        ...prev,
+        bold: prev.bold !== false,
+        color: { argb: 'FF1F4E79' },
+      };
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 export function fillFactorySheetExcelJs(ws: any, meta: FactorySheetMeta): void {
   setValue(ws.getCell('A1'), meta.plan_title);
   setValue(ws.getCell('H1'), meta.machine_code);
@@ -192,6 +219,9 @@ export function fillFactorySheetExcelJs(ws: any, meta: FactorySheetMeta): void {
       setValue(ws.getCell('A32'), instr);
     }
   }
+
+  // Title strip: light blue (same family as FILM/LENGTH header cells), never purple
+  applyTitleBannerLightBlue(ws);
 }
 
 function copyWorksheet(src: any, dst: any): void {

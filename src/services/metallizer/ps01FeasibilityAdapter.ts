@@ -874,6 +874,28 @@ export function generateMSLSlitterPlan(
   // Derive exact Reel / Pack Length from covered orders (e.g. 18,700m or 20,000m or 9,350m)
   const ordersCovered = req.orders_covered || [];
   const coveredLengths = ordersCovered.map(o => o.length_m).filter(Boolean);
+
+  /** Normalize core from order (3 / 6 / "3\"" / "6-inch") → display "3\"" / "6\"" */
+  const formatCore = (raw: any): string => {
+    if (raw == null || raw === '') return '';
+    const s = String(raw).trim();
+    if (/steel/i.test(s)) {
+      // Prefer numeric core from order body, not jumbo steel core default
+      return s;
+    }
+    const n = parseInt(s.replace(/[^0-9]/g, ''), 10);
+    if (n === 3 || n === 6) return `${n}"`;
+    if (/\d/.test(s)) return s.includes('"') ? s : `${s}"`;
+    return s;
+  };
+  const formatTreatment = (raw: any): string => {
+    if (raw == null || raw === '') return '';
+    const s = String(raw).trim().toUpperCase();
+    if (s === 'OS' || s === 'OUTSIDE' || s === 'O/S') return 'OS';
+    if (s === 'IS' || s === 'INSIDE' || s === 'I/S') return 'IS';
+    if (s.includes('BOTH')) return 'BOTH SIDE';
+    return String(raw).trim();
+  };
   const packLengthM = coveredLengths.length > 0 
     ? Math.max(...coveredLengths) 
     : Math.round(jumboLengthM / Math.max(1, req.package_multiple || 1));
@@ -1004,7 +1026,9 @@ export function generateMSLSlitterPlan(
       armCapacityLeft -= reelsToTake;
 
       const activePacks = Math.ceil(reelsToTake / arm.reelsPerPack);
-      const startPack = packOffset + 1;
+      // Prefer simulation start_pack when order began mid-run (true size/order shift)
+      const simStart = Number((ord as any).start_pack) || 0;
+      const startPack = simStart > 1 ? simStart : packOffset + 1;
       packOffset += activePacks;
       const isFuture = startPack > 1;
 
@@ -1024,8 +1048,8 @@ export function generateMSLSlitterPlan(
         film: film,
         width_mm: arm.cutWidth,
         length_m: arm.assignedLengthM,
-        core: 6,
-        treatment_side: 'OS',
+        core: formatCore((ord as any).core) || formatCore((req as any).order_core) || '',
+        treatment_side: formatTreatment((ord as any).treatment_side) || '',
         reels: reelsToTake,
         ups: isFuture ? 0 : 1,
         initial_ups: isFuture ? 0 : 1,
@@ -1113,13 +1137,16 @@ export function generateMSLSlitterPlan(
     : [];
   if (simChanges.length > 0) {
     for (const sc of simChanges) {
-      const afterPack = Math.max(0, Number(sc.after_pack) || 0);
+      let afterPack = Math.max(0, Number(sc.after_pack) || 0);
       const oldW = Number(sc.old_width_mm) || 0;
       const newW = Number(sc.new_width_mm) || 0;
-      if (afterPack <= 0 || !oldW || !newW || oldW === newW) continue;
+      if (!oldW || !newW || oldW === newW) continue;
+      // Sheet / UI treat after_pack > 0 as real shift; if 0, show as pack 1 boundary
+      if (afterPack <= 0) afterPack = 1;
       const instr =
-        sc.instruction ||
-        `AFTER PACK ${afterPack}: CHANGE SIZE ${oldW}MM → ${newW}MM`;
+        sc.instruction && !/AFTER PACK 0\b/i.test(sc.instruction)
+          ? sc.instruction
+          : `AFTER PACK ${afterPack}: CHANGE SIZE ${oldW}MM → ${newW}MM`;
       changes.push({
         id: `change-${planId}-sim-${afterPack}-${sc.position}-${oldW}-${newW}`,
         plan_id: planId,
@@ -1134,13 +1161,29 @@ export function generateMSLSlitterPlan(
         new_order_ref: sc.new_order_ref || '',
         created_at: dateStr,
       });
-      // Label items that start after this change as FUTURE SHIFT (size change)
+      // Mark items for new width that start after this pack as FUTURE SHIFT
+      let labeled = false;
       for (const it of items) {
-        if (Number(it.width_mm) === newW && Number(it.start_pack || 1) > 1) {
+        const sp = Number(it.start_pack || 1);
+        if (Number(it.width_mm) === newW && sp > 1) {
           it.is_future_replacement = true;
           it.ups = 0;
           it.initial_ups = 0;
           it.replacement_instruction = instr;
+          labeled = true;
+        }
+      }
+      // If sequential allocator put new width as pack-1 active, still force FUTURE when log says size change
+      if (!labeled) {
+        for (const it of items) {
+          if (Number(it.width_mm) === newW && Number(it.start_pack || 1) >= afterPack) {
+            it.is_future_replacement = true;
+            it.ups = 0;
+            it.initial_ups = 0;
+            it.start_pack = Math.max(Number(it.start_pack || 1), afterPack + 1);
+            it.replacement_instruction = instr;
+            labeled = true;
+          }
         }
       }
     }
@@ -1151,6 +1194,18 @@ export function generateMSLSlitterPlan(
       const k = `${c.after_pack}|${c.position}|${c.old_width_mm}|${c.new_width_mm}`;
       if (seenCh.has(k)) changes.splice(i, 1);
       else seenCh.add(k);
+    }
+  }
+
+  // Also: any item with start_pack > 1 must show FUTURE SHIFT (even customer-only)
+  for (const it of items) {
+    if (Number(it.start_pack || 1) > 1 && !it.is_future_replacement) {
+      it.is_future_replacement = true;
+      it.ups = 0;
+      it.initial_ups = 0;
+      if (!it.replacement_instruction) {
+        it.replacement_instruction = `AFTER PACK ${Number(it.start_pack) - 1}: CONTINUE ${it.width_mm}MM`;
+      }
     }
   }
 

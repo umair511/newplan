@@ -1442,6 +1442,9 @@ function optimizeDemandPool(
         required_reels: number;
         weight_kg: number;
         ups?: number;
+        core?: string | number;
+        treatment_side?: string;
+        start_pack?: number;
       }>();
 
       const filmKeyCand = String(cand.film || '').trim().toUpperCase();
@@ -1560,8 +1563,26 @@ function optimizeDemandPool(
                 canRunThisRoll = false;
                 break;
               }
+              const prevW = positions[pi].width;
+              const prevTr = positions[pi].tracker;
               positions[pi] = { width: rep.width, tracker: rep.tracker };
               widthsNow[pi] = rep.width;
+              if (prevW !== rep.width) {
+                const afterPack = Math.max(0, totalPacksAllRolls);
+                sizeChangeLog.push({
+                  after_pack: afterPack,
+                  position: pi + 1,
+                  old_width_mm: prevW,
+                  new_width_mm: rep.width,
+                  old_order_id: prevTr?.order?.id,
+                  new_order_id: rep.tracker.order.id,
+                  old_order_ref: prevTr
+                    ? `SO# ${prevTr.order.sales_order} / Item ${prevTr.order.item_number}`
+                    : undefined,
+                  new_order_ref: `SO# ${rep.tracker.order.sales_order} / Item ${rep.tracker.order.item_number} (${rep.tracker.order.customer})`,
+                  instruction: `AFTER PACK ${afterPack}: CHANGE SIZE ${prevW}MM → ${rep.width}MM`,
+                });
+              }
             }
           }
 
@@ -1628,12 +1649,16 @@ function optimizeDemandPool(
               totalAllocatedInIter += wpr;
 
               const existingCov = ordersCoveredMap.get(tr.order.id);
+              const packIndexNow = totalPacksAllRolls + packsRunThisJumbo + 1;
               if (existingCov) {
                 existingCov.required_reels += 1;
                 existingCov.weight_kg = Number((existingCov.weight_kg + wpr).toFixed(2));
                 existingCov.ups = Math.max(existingCov.ups || 0, upsThisPack.get(tr.order.id) || 1);
-                // Prefer latest physical width on this order after size-change
                 existingCov.width_mm = pos.width;
+                if (!existingCov.core && tr.order.core != null) existingCov.core = tr.order.core;
+                if (!existingCov.treatment_side && tr.order.treatment_side) {
+                  existingCov.treatment_side = tr.order.treatment_side;
+                }
               } else {
                 ordersCoveredMap.set(tr.order.id, {
                   order_id: tr.order.id,
@@ -1645,6 +1670,9 @@ function optimizeDemandPool(
                   required_reels: 1,
                   weight_kg: Number(wpr.toFixed(2)),
                   ups: upsThisPack.get(tr.order.id) || 1,
+                  core: tr.order.core,
+                  treatment_side: tr.order.treatment_side,
+                  start_pack: packIndexNow,
                 });
               }
             }
@@ -1717,6 +1745,9 @@ function optimizeDemandPool(
                   length_m: tr.pkgLength,
                   required_reels: reelsForThis,
                   weight_kg: weightForThis,
+                  core: tr.order.core,
+                  treatment_side: tr.order.treatment_side,
+                  start_pack: 1,
                 });
               }
             }

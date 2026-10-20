@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { SlitterPlan, PlanningRun, UserProfile, VA05Order } from '../types';
-import { exportSinglePlanToExcel, exportCompleteRunToExcel, downloadExcelBuffer } from '../services/excelExporter';
+import { exportSinglePlanToExcelStyled, exportCompleteRunToExcelStyled, downloadExcelBuffer } from '../services/excelExporter';
 import { 
   FileText, 
   Download, 
@@ -79,16 +79,16 @@ export const PlanningRunsList: React.FC<PlanningRunsListProps> = ({
     return true;
   });
 
-  const handleDownloadPlanExcel = (plan: SlitterPlan, e: React.MouseEvent) => {
+  const handleDownloadPlanExcel = async (plan: SlitterPlan, e: React.MouseEvent) => {
     e.stopPropagation();
-    const buffer = exportSinglePlanToExcel(plan);
+    const buffer = await exportSinglePlanToExcelStyled(plan);
     downloadExcelBuffer(buffer, `Plan_${plan.plan_number}.xlsx`);
   };
 
-  const handleDownloadRunExcel = (run: PlanningRun, e: React.MouseEvent) => {
+  const handleDownloadRunExcel = async (run: PlanningRun, e: React.MouseEvent) => {
     e.stopPropagation();
     const runPlans = plans.filter(p => p.planning_run_id === run.run_number || p.planning_run_id === run.id);
-    const buffer = exportCompleteRunToExcel(run, runPlans, orders);
+    const buffer = await exportCompleteRunToExcelStyled(run, runPlans, orders);
     downloadExcelBuffer(buffer, `All_Plans_${run.run_number}_${runPlans.length}plans.xlsx`);
   };
 
